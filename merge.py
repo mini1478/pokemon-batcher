@@ -30,9 +30,11 @@ SUB_HEAD = ('<?xml version="1.0" encoding="UTF-8"?>\n'
             ' <metadata name="BambuStudio:3mfVersion">1</metadata>\n <resources>\n')
 
 
-def filament_key_shapes(index):
-    """project_settings keys that hold k entries per filament -> k, learnt from
-    files with different filament counts."""
+def per_filament_keys(index):
+    """project_settings keys that hold a fixed number of entries per filament,
+    learnt from files with different filament counts. How many per filament
+    depends on the Bambu Studio version that saved the file: newer ones keep
+    one value per nozzle type (Standard, High Flow), so it is not stored here."""
     seen = {}
     for f, c in index.items():
         if f == '_version' or not c.get('info'):
@@ -42,16 +44,13 @@ def filament_key_shapes(index):
             continue
         for k, ln in c['info']['list_lens'].items():
             seen.setdefault(k, set()).add((n, ln))
-    shapes = {}
+    keys = set()
     for k, pairs in seen.items():
-        if len({n for n, _ in pairs}) < 2:
+        if len({n for n, _ in pairs}) < 2 or len({ln for _, ln in pairs}) < 2:
             continue
-        ratios = {ln / n for n, ln in pairs}
-        if len(ratios) == 1:
-            r = ratios.pop()
-            if r == int(r) and r >= 1:
-                shapes[k] = int(r)
-    return shapes
+        if all(ln >= n and ln % n == 0 for n, ln in pairs):
+            keys.add(k)
+    return keys - {'flush_volumes_matrix', 'filament_self_index'}
 
 
 class MeshSource:
@@ -100,7 +99,7 @@ def _write_vertices(out, pts):
 def write_batch(out_path, plate_layout, index, title, progress=None):
     """plate_layout: [(colour, [(part, x, y, rotated), ...]), ...] from planner.layout
     over planner.split pieces."""
-    shapes = filament_key_shapes(index)
+    per_fil = per_filament_keys(index)
     files = []
     for _, pl in plate_layout:
         for p, *_ in pl:
@@ -230,7 +229,7 @@ def write_batch(out_path, plate_layout, index, title, progress=None):
             ET.indent(so, space='  ', level=1)
             cfg += '  ' + ET.tostring(so, encoding='unicode').rstrip() + '\n'
         cfg += '\n'.join(plates_xml) + '\n</config>\n'
-        proj = _merge_project(srcs[base_file]['proj'], slots, slot_src, srcs, shapes)
+        proj = _merge_project(srcs[base_file]['proj'], slots, slot_src, srcs, per_fil)
 
         z.writestr('[Content_Types].xml',
                    '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -314,28 +313,42 @@ def _esc(s):
     return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
 
 
-def _merge_project(base, slots, slot_src, srcs, shapes):
+def _per_filament(values, n):
+    """Entries per filament of a list setting, or None if it does not divide."""
+    if not isinstance(values, list) or not values or not n or len(values) % n:
+        return None
+    return len(values) // n
+
+
+def _merge_project(base, slots, slot_src, srcs, per_fil):
+    """The base file's settings, with every per-filament list rebuilt for the
+    batch's filaments in the base file's own layout."""
     proj = json.loads(json.dumps(base))
     n_out = len(slots)
-    for k, kper in shapes.items():
-        if k not in proj or not isinstance(proj[k], list):
+    n_base = len(base.get('filament_colour', [])) or 1
+    for k in per_fil:
+        bv = proj.get(k)
+        kper = _per_filament(bv, n_base)
+        if not kper:
             continue
         vals = []
         for f, fid, _ in slot_src:
             src = srcs[f]['proj']
             v = src.get(k)
             n_src = len(src.get('filament_colour', [])) or 1
-            if isinstance(v, list) and len(v) == n_src * kper and fid < n_src:
-                vals += v[fid * kper:(fid + 1) * kper]
+            sk = _per_filament(v, n_src)
+            if sk and fid < n_src:
+                # a file from another Bambu Studio version may keep fewer values per
+                # filament: its own first, the base file's for the rest
+                vals += (v[fid * sk:(fid + 1) * sk] + bv[sk:kper])[:kper]
             else:
-                bv = proj[k]
-                vals += (bv[:kper] if len(bv) >= kper else bv * kper)[:kper]
+                vals += bv[:kper]
         proj[k] = vals
     proj['filament_colour'] = [h for _, _, h in slot_src]
     # packed plates have no room for print-by-object clearances
     proj['print_sequence'] = 'by layer'
     if 'filament_self_index' in proj:
-        k = shapes.get('filament_self_index', 1)
+        k = _per_filament(proj['filament_self_index'], n_base) or 1
         proj['filament_self_index'] = [str(i + 1) for i in range(n_out) for _ in range(k)]
     if 'flush_volumes_matrix' in proj:
         proj['flush_volumes_matrix'] = ['0' if i == j else FLUSH for i in range(n_out) for j in range(n_out)]
