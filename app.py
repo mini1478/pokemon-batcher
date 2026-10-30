@@ -137,7 +137,7 @@ class App:
         self.canvas.bind('<Motion>', self._hover)
         self.canvas.bind('<Leave>', lambda e: self._set_hover(None))
         self.canvas.bind('<Configure>', lambda e: self.redraw())
-        self.canvas.bind_all('<MouseWheel>', lambda e: self.canvas.yview_scroll(-e.delta // 40, 'units'))
+        self.canvas.bind_all('<MouseWheel>', self._wheel)
         self.hover_row = None
         self.rows = []
         ttk.Label(left, text='Click the box to mark a print as printed.   Right-click a row: always include it, '
@@ -157,6 +157,9 @@ class App:
                         command=self._settings_changed).pack(anchor='w', pady=(2, 10))
         self.go = ttk.Button(card, text='Make next batch', style='Go.TButton', command=self.make_batch)
         self.go.pack(fill='x')
+        self.go_all = ttk.Button(card, text='Batch everything left', command=self.batch_all)
+        self.go_all.pack(fill='x', pady=(6, 0))
+        self.all_running = self.stop_all = False
         self.pins_lbl = ttk.Label(card, text='', style='Dim.TLabel', wraplength=420)
         self.pins_lbl.pack(anchor='w', pady=(8, 0))
 
@@ -179,9 +182,19 @@ class App:
 
         q = ttk.Frame(right, style='Panel.TFrame', padding=16)
         q.pack(fill='both', expand=True, pady=(12, 0))
-        ttk.Label(q, text='Batch files waiting to print', style='PH.TLabel').pack(anchor='w')
-        self.qframe = ttk.Frame(q, style='Panel.TFrame')
-        self.qframe.pack(fill='both', expand=True, pady=(8, 0))
+        self.q_title = ttk.Label(q, text='Batch files waiting to print', style='PH.TLabel')
+        self.q_title.pack(anchor='w')
+        qwrap = ttk.Frame(q, style='Panel.TFrame')
+        qwrap.pack(fill='both', expand=True, pady=(8, 0))
+        self.qcanvas = tk.Canvas(qwrap, bg=PANEL, highlightthickness=0)
+        self.qbar = ttk.Scrollbar(qwrap, orient='vertical', command=self.qcanvas.yview)
+        self.qcanvas.configure(yscrollcommand=self.qbar.set)
+        self.qcanvas.pack(side='left', fill='both', expand=True)
+        self.qframe = ttk.Frame(self.qcanvas, style='Panel.TFrame')
+        qwin = self.qcanvas.create_window(0, 0, window=self.qframe, anchor='nw')
+        self.qframe.bind('<Configure>', lambda e: self._queue_fit())
+        self.qcanvas.bind('<Configure>', lambda e: (self.qcanvas.itemconfigure(qwin, width=e.width),
+                                                    self._queue_fit()))
 
         self.statusbar = ttk.Label(self.root, text='', foreground=DIM, padding=(14, 4))
         self.statusbar.pack(side='bottom', fill='x', before=left)
@@ -430,26 +443,38 @@ class App:
         self._discard(old, ask=False)
         self._write(self.ranked[self.rank_i])
 
-    def _write(self, ranked):
-        nplates, ncol, keys = ranked
+    def _build_file(self, keys, prefix=''):
+        """Measures, packs and writes one batch; runs on a worker thread.
+        Returns (file, plate layout)."""
         os.makedirs(self.settings.out_dir, exist_ok=True)
         out = os.path.join(self.settings.out_dir, st.batch_name(self.items, keys))
         title = ' + '.join(st.short(self.by_key[k]) for k in keys)
         names = {it['key']: it['name'] for it in self.items}
+        pieces = planner.split(
+            [p for k in keys for p in self.parts[k]], self.index, names,
+            lambda i, n, f: self.ui(self.status, f'{prefix}Measuring parts {i + 1}/{n}: '
+                                                 f'{os.path.basename(f)} (first time is slow)…'))
+        lay = planner.layout(pieces)
+        merge.write_batch(out, lay, self.index, title,
+                          lambda i, n: self.ui(self.status, f'{prefix}Copying meshes {i + 1}/{n}…'))
+        return out, lay
+
+    def _register(self, out, keys, lay):
+        plates = [{'colour': c, 'items': sorted({p.item for p, *_ in pl}), 'parts': len(pl)} for c, pl in lay]
+        batch = {'file': out, 'keys': keys, 'plates': plates}
+        self.state.batches = [b for b in self.state.batches if b['file'] != out] + [batch]
+        self.state.save()
+        return batch
+
+    def _write(self, ranked):
+        nplates, ncol, keys = ranked
         self.busy = True
         self._buttons()
 
         def work():
-            lay = []
+            out, lay, err = None, [], None
             try:
-                pieces = planner.split(
-                    [p for k in keys for p in self.parts[k]], self.index, names,
-                    lambda i, n, f: self.ui(self.status, f'Measuring parts {i + 1}/{n}: '
-                                                                    f'{os.path.basename(f)} (first time is slow)…'))
-                lay = planner.layout(pieces)
-                merge.write_batch(out, lay, self.index, title,
-                                  lambda i, n: self.ui(self.status, f'Copying meshes {i + 1}/{n}…'))
-                err = None
+                out, lay = self._build_file(keys)
             except Exception as e:  # shown to the user, the app keeps running
                 err = f'{type(e).__name__}: {e}'
             self.ui(self._written, out, keys, lay, err)
@@ -462,15 +487,72 @@ class App:
             self.status('Writing failed.')
             messagebox.showerror('Pokémon Batcher', f'Could not write the batch file:\n{err}')
             return
-        plates = [{'colour': c, 'items': sorted({p.item for p, *_ in pl}), 'parts': len(pl)} for c, pl in lay]
-        batch = {'file': out, 'keys': keys, 'plates': plates}
-        self.state.batches = [b for b in self.state.batches if b['file'] != out] + [batch]
-        self.state.save()
+        batch = self._register(out, keys, lay)
         self.current = batch
         self.show_batch(batch)
         self.redraw()
         self.refresh_queue()
         self.status(f'Saved {out}')
+
+    def batch_all(self):
+        if self.all_running:
+            self.stop_all = True
+            self._buttons()
+            return
+        if self.busy or not self.state:
+            return
+        self._settings_changed()
+        pool = self._pool()
+        if not pool:
+            messagebox.showinfo('Pokémon Batcher', 'Nothing left to batch.')
+            return
+        size = self.state.size
+        n = -(-len(pool) // size)
+        if not messagebox.askyesno(
+                'Pokémon Batcher',
+                f'Make {n} batch file{"s" if n != 1 else ""} for all {len(pool)} prints left '
+                f'({size} per batch)?\n\nEach batch takes the prints that share the most colours '
+                f'with each other. This can take a while and the files can add up to several GB. '
+                f'You can stop it after any batch.'):
+            return
+        must = [k for k in self.state.pins if k in pool]
+        self.busy, self.all_running, self.stop_all = True, True, False
+        self._buttons()
+
+        def work():
+            left, done, err = list(pool), 0, None
+            try:
+                while left and not self.stop_all:
+                    k = min(size, len(left))
+                    self.ui(self.status, f'Batch {done + 1}/{n}: looking for the best set…')
+                    ranked = planner.best_batches(self.parts, left, k, [m for m in must if m in left])
+                    if not ranked:
+                        break
+                    keys = ranked[0][2]
+                    out, lay = self._build_file(keys, f'Batch {done + 1}/{n}: ')
+                    self.ui(self._all_step, out, keys, lay)
+                    left = [x for x in left if x not in keys]
+                    done += 1
+            except Exception as e:  # shown to the user, the app keeps running
+                err = f'{type(e).__name__}: {e}'
+            self.ui(self._all_done, done, len(left), err)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _all_step(self, out, keys, lay):
+        self._register(out, keys, lay)
+        self.redraw()
+        self.refresh_queue()
+
+    def _all_done(self, done, left, err):
+        self.busy, self.all_running, self.stop_all = False, False, False
+        self.ranked = []
+        self._buttons()
+        self.redraw()
+        self.refresh_queue()
+        msg = f'Made {done} batch file{"s" if done != 1 else ""}.' + (f' {left} prints not batched.' if left else '')
+        self.status(msg)
+        if err:
+            messagebox.showerror('Pokémon Batcher', f'{msg}\n\nStopped by an error:\n{err}')
 
     def show_batch(self, b):
         n = len(b['plates'])
@@ -496,6 +578,12 @@ class App:
         for b in (self.b_open, self.b_show, self.b_other, self.b_done):
             b.state(['!disabled'] if have else ['disabled'])
         self.go.state(['disabled'] if self.busy else ['!disabled'])
+        if self.all_running:
+            self.go_all.configure(text='Stopping after this batch…' if self.stop_all else 'Stop after this batch')
+            self.go_all.state(['disabled'] if self.stop_all else ['!disabled'])
+        else:
+            self.go_all.configure(text='Batch everything left')
+            self.go_all.state(['disabled'] if self.busy else ['!disabled'])
 
     def open_current(self):
         if self.current:
@@ -564,10 +652,33 @@ class App:
         self.redraw()
         self.refresh_queue()
 
+    def _wheel(self, e):
+        """Scrolls whichever list is under the mouse."""
+        w = self.root.winfo_containing(e.x_root, e.y_root)
+        while w is not None and w not in (self.canvas, self.qcanvas):
+            w = w.master
+        if w is self.qcanvas:
+            if self.qcanvas.yview() != (0.0, 1.0):
+                self.qcanvas.yview_scroll(-e.delta // 120 * 2, 'units')
+        elif w is self.canvas:
+            self.canvas.yview_scroll(-e.delta // 40, 'units')
+
+    def _queue_fit(self):
+        """Scroll region follows the rows; the scrollbar only shows when needed."""
+        c = self.qcanvas
+        c.configure(scrollregion=(0, 0, c.winfo_width(), self.qframe.winfo_reqheight()))
+        if self.qframe.winfo_reqheight() > c.winfo_height() > 1:
+            if not self.qbar.winfo_ismapped():
+                self.qbar.pack(side='right', fill='y', before=c)
+        elif self.qbar.winfo_ismapped():
+            self.qbar.pack_forget()
+            c.yview_moveto(0)
+
     def refresh_queue(self):
         for w in self.qframe.winfo_children():
             w.destroy()
         live = self.state.live_batches() if self.state else []
+        self.q_title.configure(text='Batch files waiting to print' + (f'  ({len(live)})' if live else ''))
         if not live:
             ttk.Label(self.qframe, text='None — every batch is printed.', style='Dim.TLabel').pack(anchor='w')
             return
@@ -576,7 +687,7 @@ class App:
             row.pack(fill='x', pady=3)
             names = ' + '.join(self.by_key[k]['name'] for k in b['keys'] if k in self.by_key)
             lbl = ttk.Label(row, text=f"{names}  ·  {len(b.get('plates', []))} plates", style='Panel.TLabel',
-                            wraplength=420, cursor='hand2')
+                            wraplength=380, cursor='hand2')
             lbl.pack(anchor='w')
             lbl.bind('<Button-1>', lambda e, b=b: self._select(b))
             bar = ttk.Frame(row, style='Panel.TFrame')
